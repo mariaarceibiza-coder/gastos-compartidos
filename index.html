@@ -124,7 +124,7 @@
         firebase.initializeApp(firebaseConfig);
         const db = firebase.firestore();
 
-        const { useState, useEffect } = React;
+        const { useState, useEffect, useRef } = React;
 
         function App() {
             const [ingresos, setIngresos] = useState(3350);
@@ -151,22 +151,30 @@
             const [loading, setLoading] = useState(true);
             const [synced, setSynced] = useState(false);
 
+            const saveTimerRef = useRef(null);
+            const isLocalSaveRef = useRef(false);
+
             const mesKey = `${añoActual}-${mesActual}`;
 
+            // Load data from Firebase - skip overwriting local state when the change came from us
             useEffect(() => {
                 const unsubscribe = db.collection('gastos').doc('data').onSnapshot((doc) => {
                     if (doc.exists) {
                         const data = doc.data();
-                        setIngresos(data.ingresos || 3350);
-                        setGastosFijos(data.gastosFijos || gastosFijos);
-                        setSaldoAhorro(data.saldoAhorro || 0);
-                        setHistorico(data.historico || {});
-                        
-                        const mesData = data.historico?.[mesKey];
-                        if (mesData) {
-                            setGastosVariables(mesData.gastosVariables || []);
+                        if (!isLocalSaveRef.current) {
+                            setIngresos(data.ingresos || 3350);
+                            setGastosFijos(data.gastosFijos || gastosFijos);
+                            setSaldoAhorro(data.saldoAhorro || 0);
+                            setHistorico(data.historico || {});
+
+                            const mesData = data.historico?.[mesKey];
+                            if (mesData) {
+                                setGastosVariables(mesData.gastosVariables || []);
+                            } else {
+                                setGastosVariables([]);
+                            }
                         } else {
-                            setGastosVariables([]);
+                            isLocalSaveRef.current = false;
                         }
                     }
                     setLoading(false);
@@ -177,32 +185,43 @@
                 return () => unsubscribe();
             }, [mesKey]);
 
+            // Save to Firebase with debounce to avoid circular updates on every keystroke
             useEffect(() => {
                 if (loading) return;
 
-                const nuevoHistorico = {
-                    ...historico,
-                    [mesKey]: {
-                        gastosVariables,
+                if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+
+                saveTimerRef.current = setTimeout(() => {
+                    isLocalSaveRef.current = true;
+
+                    const nuevoHistorico = {
+                        ...historico,
+                        [mesKey]: {
+                            gastosVariables,
+                            ingresos,
+                            gastosFijos: gastosFijos.map(g => ({...g})),
+                            totalGastosFijos: gastosFijos.reduce((sum, g) => sum + g.presupuesto, 0),
+                            totalGastosVariables: gastosVariables.reduce((sum, g) => sum + g.monto, 0)
+                        }
+                    };
+
+                    db.collection('gastos').doc('data').set({
                         ingresos,
-                        gastosFijos: gastosFijos.map(g => ({...g})),
-                        totalGastosFijos: gastosFijos.reduce((sum, g) => sum + g.presupuesto, 0),
-                        totalGastosVariables: gastosVariables.reduce((sum, g) => sum + g.monto, 0)
-                    }
+                        gastosFijos,
+                        saldoAhorro,
+                        historico: nuevoHistorico,
+                        updatedAt: firebase.firestore.FieldValue.serverTimestamp()
+                    }).then(() => {
+                        setSynced(true);
+                        setTimeout(() => setSynced(false), 2000);
+                    });
+
+                    setHistorico(nuevoHistorico);
+                }, 500);
+
+                return () => {
+                    if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
                 };
-
-                db.collection('gastos').doc('data').set({
-                    ingresos,
-                    gastosFijos,
-                    saldoAhorro,
-                    historico: nuevoHistorico,
-                    updatedAt: firebase.firestore.FieldValue.serverTimestamp()
-                }).then(() => {
-                    setSynced(true);
-                    setTimeout(() => setSynced(false), 2000);
-                });
-
-                setHistorico(nuevoHistorico);
             }, [ingresos, gastosFijos, gastosVariables, saldoAhorro, mesKey]);
 
             const totalGastosFijos = gastosFijos.reduce((sum, g) => sum + g.presupuesto, 0);
@@ -339,11 +358,17 @@
                                 <div className="section-title">Ingresos y Gastos Fijos</div>
                                 <div className="green-box">
                                     <label className="label">Ingresos Mensuales</label>
-                                    <input className="input-full" type="number" value={ingresos} onChange={e => setIngresos(parseFloat(e.target.value) || 0)} step="0.01" />
+                                    <input className="input-full" type="number" value={ingresos} onChange={e => {
+                                        const val = e.target.value;
+                                        setIngresos(val === '' ? 0 : parseFloat(val) || 0);
+                                    }} step="0.01" />
                                 </div>
                                 <div className="purple-box">
                                     <label className="label">💰 Saldo Total en Cuenta de Ahorro</label>
-                                    <input className="input-purple" type="number" value={saldoAhorro} onChange={e => setSaldoAhorro(parseFloat(e.target.value) || 0)} step="0.01" />
+                                    <input className="input-purple" type="number" value={saldoAhorro} onChange={e => {
+                                        const val = e.target.value;
+                                        setSaldoAhorro(val === '' ? 0 : parseFloat(val) || 0);
+                                    }} step="0.01" />
                                     <div style={{marginTop:'0.5rem',fontSize:'0.75rem',color:'#6B7280'}}>
                                         Este es tu saldo acumulado total en la cuenta de ahorro
                                     </div>
@@ -379,4 +404,98 @@
                                     const newId = Math.max(...gastosFijos.map(g => g.id), 0) + 1;
                                     setGastosFijos([...gastosFijos, {id: newId, categoria: 'Nuevo gasto', presupuesto: 0, pagado: false}]);
                                     setEditingFijo(newId);
-                
+                                }}>+ Añadir Gasto Fijo</button>
+
+                                <div className="summary">
+                                    <div className="summary-row">
+                                        <span className="summary-label">Total Gastos Fijos</span>
+                                        <span className="summary-value">{totalGastosFijos.toFixed(2)} €</span>
+                                    </div>
+                                    <div className="summary-row">
+                                        <span className="summary-label">Pagados</span>
+                                        <span className="summary-value text-green">{totalGastosFijosPagados.toFixed(2)} €</span>
+                                    </div>
+                                    <div className="summary-row">
+                                        <span className="summary-label">Pendientes</span>
+                                        <span className="summary-value text-red">{totalGastosFijosPendientes.toFixed(2)} €</span>
+                                    </div>
+                                    <div className="summary-row">
+                                        <span className="summary-label">Resto para gastos</span>
+                                        <span className="summary-value text-xl" style={{color: resto >= 0 ? '#16A34A' : '#DC2626'}}>{resto.toFixed(2)} €</span>
+                                    </div>
+                                </div>
+                                <div className="daily-box">
+                                    <div className="summary-row">
+                                        <span className="summary-label">Presupuesto diario</span>
+                                        <span className="summary-value" style={{color:'#4F46E5'}}>{presupuestoDiario.toFixed(2)} €/día</span>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        {gastosVariables.length > 0 && (
+                            <div className="card">
+                                <div className="section-title">Gastos Variables - {meses[mesActual]} {añoActual}</div>
+                                <table>
+                                    <thead>
+                                        <tr>
+                                            <th>Fecha</th>
+                                            <th>Descripción</th>
+                                            <th className="text-right">Importe</th>
+                                            <th></th>
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                        {gastosVariables.sort((a, b) => a.fecha.localeCompare(b.fecha)).map(g => (
+                                            <tr key={g.id}>
+                                                <td>{g.fecha}</td>
+                                                <td>{g.descripcion}</td>
+                                                <td className="text-right" style={{fontWeight:'600'}}>{g.monto.toFixed(2)} €</td>
+                                                <td>
+                                                    <button className="btn-icon" onClick={() => setGastosVariables(gastosVariables.filter(x => x.id !== g.id))}>🗑</button>
+                                                </td>
+                                            </tr>
+                                        ))}
+                                    </tbody>
+                                </table>
+                            </div>
+                        )}
+
+                        {mostrarHistorico && (
+                            <div className="modal" onClick={() => setMostrarHistorico(false)}>
+                                <div className="modal-content" onClick={e => e.stopPropagation()}>
+                                    <div className="modal-header">
+                                        <div className="modal-title">📊 Histórico</div>
+                                        <button className="btn-close" onClick={() => setMostrarHistorico(false)}>✕</button>
+                                    </div>
+                                    {historicoOrdenado.length === 0 ? (
+                                        <div className="empty-state">No hay datos históricos</div>
+                                    ) : (
+                                        historicoOrdenado.map(key => {
+                                            const [año, mes] = key.split('-').map(Number);
+                                            const data = historico[key];
+                                            return (
+                                                <div key={key} className="historico-item" onClick={() => cargarMesHistorico(key)}>
+                                                    <div className="historico-mes">{meses[mes]} {año}</div>
+                                                    <div className="historico-stats">
+                                                        <div>Ingresos: {(data.ingresos || 0).toFixed(2)} €</div>
+                                                        <div>G. Fijos: {(data.totalGastosFijos || 0).toFixed(2)} €</div>
+                                                        <div>G. Variables: {(data.totalGastosVariables || 0).toFixed(2)} €</div>
+                                                        <div>Restante: {((data.ingresos || 0) - (data.totalGastosFijos || 0) - (data.totalGastosVariables || 0)).toFixed(2)} €</div>
+                                                    </div>
+                                                </div>
+                                            );
+                                        })
+                                    )}
+                                </div>
+                            </div>
+                        )}
+                    </div>
+                </div>
+            );
+        }
+
+        ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+    </script>
+</body>
+</html>
